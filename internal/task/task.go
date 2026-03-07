@@ -1,6 +1,9 @@
-package middleware
+package task
 
-import "context"
+import (
+	"context"
+	"reflect"
+)
 
 // Task represents a unit of work to be processed by the worker pool.
 type Task struct {
@@ -36,4 +39,10 @@ type TaskQueue interface {
 	// Nack indicates that a task has failed to process and should be retried or discarded based on the retry policy.
 	// It takes a context for cancelling the nack operation and the Task that failed to process.
 	Nack(ctx context.Context, task Task) error
+	// Size returns the current number of pending tasks in the queue
+	Size() int64
+}
+
+func GetTaskName[T any]() string {
+	return reflect.TypeOf((*T)(nil)).Elem().String()
 }

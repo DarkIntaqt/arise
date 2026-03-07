@@ -3,54 +3,58 @@ package queues
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
-	"github.com/DarkIntaqt/arise/middleware"
+	"github.com/DarkIntaqt/arise/internal/task"
 )
 
 type ChannelQueue struct {
-	pending  chan middleware.Task
-	inFlight map[string]middleware.Task
+	pending  chan task.Task
+	size     atomic.Int64
+	inFlight map[string]task.Task
 	mu       sync.RWMutex
 }
 
 func NewChannelQueue(bufferSize int) *ChannelQueue {
 	return &ChannelQueue{
-		pending:  make(chan middleware.Task, bufferSize),
-		inFlight: make(map[string]middleware.Task),
+		pending:  make(chan task.Task, bufferSize),
+		inFlight: make(map[string]task.Task),
 	}
 }
 
-func (c *ChannelQueue) Enqueue(ctx context.Context, task middleware.Task) error {
+func (c *ChannelQueue) Enqueue(ctx context.Context, task task.Task) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case c.pending <- task:
+		c.size.Add(1)
 		return nil
 	}
 }
 
-func (c *ChannelQueue) Consume(ctx context.Context) (<-chan middleware.Task, error) {
-	out := make(chan middleware.Task)
+func (c *ChannelQueue) Consume(ctx context.Context) (<-chan task.Task, error) {
+	out := make(chan task.Task)
 	go func() {
 		defer close(out)
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case task, ok := <-c.pending:
+			case t, ok := <-c.pending:
 				if !ok {
 					return
 				}
 
+				c.size.Add(-1)
 				c.mu.Lock()
-				c.inFlight[task.Id] = task
+				c.inFlight[t.Id] = t
 				c.mu.Unlock()
 
 				select {
-				case out <- task:
+				case out <- t:
 				case <-ctx.Done():
 					// If the pool is shutting down and can't take the task, Nack it
-					c.Nack(context.Background(), task)
+					c.Nack(context.Background(), t)
 					return
 				}
 			}
@@ -60,7 +64,7 @@ func (c *ChannelQueue) Consume(ctx context.Context) (<-chan middleware.Task, err
 	return out, nil
 }
 
-func (c *ChannelQueue) Ack(ctx context.Context, task middleware.Task) error {
+func (c *ChannelQueue) Ack(ctx context.Context, task task.Task) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -68,7 +72,7 @@ func (c *ChannelQueue) Ack(ctx context.Context, task middleware.Task) error {
 	return nil
 }
 
-func (c *ChannelQueue) Nack(ctx context.Context, task middleware.Task) error {
+func (c *ChannelQueue) Nack(ctx context.Context, task task.Task) error {
 	c.mu.Lock()
 	_, exists := c.inFlight[task.Id]
 	if exists {
@@ -82,4 +86,8 @@ func (c *ChannelQueue) Nack(ctx context.Context, task middleware.Task) error {
 	}
 
 	return nil
+}
+
+func (c *ChannelQueue) Size() int64 {
+	return c.size.Load()
 }

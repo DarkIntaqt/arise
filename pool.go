@@ -1,4 +1,4 @@
-package worker
+package arise
 
 import (
 	"context"
@@ -7,8 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/DarkIntaqt/arise/internal"
-	"github.com/DarkIntaqt/arise/middleware"
+	"github.com/DarkIntaqt/arise/internal/task"
 )
 
 // PoolState represents the current state of the worker pool.
@@ -27,9 +26,9 @@ const (
 // Pool manages a set of worker goroutines that consume tasks from a TaskQueue and process them using handler functions
 // It can be started and gracefully shut down, ensuring that all in-flight tasks are completed before stopping the workers.
 type Pool struct {
-	queue     middleware.TaskQueue
+	queue     TaskQueue
 	workers   uint
-	handler   map[string]middleware.TaskHandler
+	handler   map[string]TaskHandler
 	handlerMu sync.RWMutex
 	wg        sync.WaitGroup
 
@@ -42,11 +41,17 @@ type Pool struct {
 // PoolOpt defines the configuration options for creating a new worker pool.
 type PoolOpt struct {
 	// Queue: The TaskQueue from which the pool will consume tasks. This is required and cannot be nil.
-	Queue middleware.TaskQueue
-	// Workers: The number of worker goroutines to start. This must be greater than 0.
-	Workers uint
-	// Handler: A map of task type names to their corresponding handler functions. This is optional and can be empty, but handlers must be registered before starting the pool.
-	Handler map[string]middleware.TaskHandler
+	Queue TaskQueue
+	// Worker: The number of worker goroutines to start. This must be greater than 0.
+	Worker uint
+}
+
+// FromProducer creates a new worker pool using the TaskQueue from the provided Producer and the specified PoolOpt configuration.
+func FromProducer(p *Producer, opt PoolOpt) *Pool {
+	return NewPool(PoolOpt{
+		Queue:  p.queue,
+		Worker: opt.Worker,
+	})
 }
 
 func NewPool(opt PoolOpt) *Pool {
@@ -54,21 +59,14 @@ func NewPool(opt PoolOpt) *Pool {
 		panic("Queue cannot be nil")
 	}
 
-	if opt.Workers == 0 {
-		panic("Workers must be greater than 0")
-	}
-
-	handlers := make(map[string]middleware.TaskHandler)
-	if opt.Handler != nil {
-		for k, v := range opt.Handler {
-			handlers[k] = v
-		}
+	if opt.Worker == 0 {
+		panic("Worker must be greater than 0")
 	}
 
 	return &Pool{
 		queue:   opt.Queue,
-		workers: opt.Workers,
-		handler: handlers,
+		workers: opt.Worker,
+		handler: make(map[string]TaskHandler),
 	}
 }
 
@@ -78,7 +76,7 @@ func RegisterHandler[T any](p *Pool, handler func(context.Context, T) error) {
 	p.handlerMu.Lock()
 	defer p.handlerMu.Unlock()
 
-	name := internal.GetTaskName[T]()
+	name := task.GetTaskName[T]()
 	p.handler[name] = func(ctx context.Context, val any) error {
 		if typedVal, ok := val.(T); ok {
 			return handler(ctx, typedVal)
@@ -158,6 +156,49 @@ func (p *Pool) Shutdown(ctx context.Context) error {
 	}
 }
 
+// State returns the current state of the worker pool, which can be Stopped, Running, or ShuttingDown.
 func (p *Pool) State() PoolState {
 	return PoolState(p.state.Load())
+}
+
+// worker is the main loop for each worker goroutine. It listens for tasks on the provided channel and processes them using the registered handlers.
+// Additionally, it handles graceful shutdown signals and recovers from panics to ensure the worker pool remains resilient and continues processing tasks even if individual workers encounter errors.
+func (p *Pool) worker(ctx context.Context, id int, tasks <-chan task.Task) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("Worker %d panicked: %v. Restarting...\n", id, r)
+			go p.worker(ctx, id, tasks) // Restart the worker
+		} else {
+			p.wg.Done()
+		}
+	}()
+
+	for {
+		select {
+		case <-p.shutdown:
+			return
+		case t, ok := <-tasks:
+			if !ok {
+				return
+			}
+
+			p.handlerMu.RLock()
+			handler, exists := p.handler[t.TaskName]
+			p.handlerMu.RUnlock()
+			if !exists {
+				_ = p.queue.Ack(ctx, t)
+				continue // silent discard
+			}
+
+			if err := handler(ctx, t.Payload); err != nil {
+				if nackErr := p.queue.Nack(ctx, t); nackErr != nil {
+					fmt.Printf("Worker %d: Nack failed: %v\n", id, nackErr)
+				}
+			} else {
+				if ackErr := p.queue.Ack(ctx, t); ackErr != nil {
+					fmt.Printf("Worker %d: Ack failed: %v\n", id, ackErr)
+				}
+			}
+		}
+	}
 }
