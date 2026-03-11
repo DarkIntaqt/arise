@@ -31,3 +31,8 @@ func (p *Producer) Enqueue(ctx context.Context, t any) error {
 		Id:         uuid.NewString(),
 	})
 }
+
+// Size returns the current number of pending tasks in the TaskQueue.
+func (p *Producer) Size() int64 {
+	return p.queue.Size()
+}

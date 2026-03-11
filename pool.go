@@ -202,3 +202,8 @@ func (p *Pool) worker(ctx context.Context, id int, tasks <-chan task.Task) {
 		}
 	}
 }
+
+// Size returns the current number of pending tasks in the Pool.
+func (p *Pool) Size() int64 {
+	return p.queue.Size()
+}
